@@ -1,0 +1,31 @@
+[package]
+name = "_3dtile"
+version = "0.1.0"
+edition = "2021"
+description = "FBX to 3D Tiles converter with LOD support"
+
+[[bin]]
+name = "_3dtile"
+path = "src/main.rs"
+
+[dependencies]
+# FBX 解析（C 库通过 cargo 自动编译，不需要 vcpkg）
+ufbx = "0.11"
+
+# CLI 解析
+clap = { version = "4", features = ["derive"] }
+
+# 错误处理
+anyhow = "1"
+
+# 序列化（后续写 tileset.json 用）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 贴图压缩：降采样 + JPEG 重编码（显存/加载速度的关键，实测 286MB→~20MB）
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

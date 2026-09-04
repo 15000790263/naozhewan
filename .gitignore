@@ -1,0 +1,26 @@
+# Rust 构建产物（target/ 占空间大，每次 build 都会变，绝不入库）
+/target/
+
+# Cargo.lock：Rust 单库应用可以入，但本项目是工具（CLI），按惯例 Cargo.lock 不入库；
+# 如果要可复现构建，把 Cargo.lock 也入库。
+# 选不入：每个 FBX 输入 + 切分策略产物可能差很多，工具语义上不锁定依赖版本。
+Cargo.lock
+
+# CDP 调试截图（本地排查用）
+cdp_shot.png
+cdp_shot_nobg.png
+
+# 编辑器/系统临时文件
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# 切片产物（输出在外部 out/ 目录，如 D:/fbx_convert/out_abc_pick）
+# 这里只列规则：工具运行时不应当用源码目录当产物输出地，
+# 真有产物误落到这里请清理掉
+/out_*/
+
+# 临时调试文件
+*.tmp
+*.bak
