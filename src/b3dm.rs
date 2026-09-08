@@ -130,67 +130,112 @@ impl TileGeometry {
 /// `cell_size <= 0` 时原样返回（LOD0 不简化）。
 ///
 /// ⚠️ 只合并位置落在同一格的顶点，**不跨格做平均**——否则会让模型表面收缩。
-pub fn simplify_mesh(m: &MeshData, cell_size: f32) -> MeshData {
-    if cell_size <= 0.0 || m.positions.is_empty() {
+/// 简化 mesh。
+///
+/// 参数 `keep_ratio`：保留的三角形比例（0.0~1.0）。>= 1.0 表示不简化。
+///
+/// 【为什么用比例而不是误差阈值驱动】
+///   LOD 金字塔里粗层节点天然包含"整棵子树的全部几何"（根节点 = 全模型），
+///   用"相对误差"驱动时，误差设小了减不动（实测 L0 仍有 120MB），设大了形状崩。
+///   而 Cesium ion / CesiumLab 的粗层是**目标三角形数明确**的（几万级别，
+///   保证远景秒开）。所以改成按层给比例，配合一个宽松的误差上限兜底防崩。
+pub fn simplify_mesh(m: &MeshData, keep_ratio: f32) -> MeshData {
+    if keep_ratio >= 1.0 || keep_ratio <= 0.0 || m.positions.is_empty() || m.indices.is_empty() {
         return m.clone();
     }
 
-    let mut map: std::collections::HashMap<[i32; 3], u32> = std::collections::HashMap::new();
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(m.positions.len() / 2);
-    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(m.positions.len() / 2);
-    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(m.positions.len() / 2);
-    // 原顶点下标 -> 聚类后的新下标
-    let mut remap: Vec<u32> = Vec::with_capacity(m.positions.len());
+    // ===== meshoptimizer QEM 简化 =====
+    //
+    // 为什么放弃顶点分桶（cell clustering）：
+    //   分桶按"顶点落在哪个网格格子"合并，格子一大就把地面/墙面整片糊掉
+    //   （用户描述"像狗咬了一部分"），而且合并后顶点序变了，batch_ids 需要
+    //   remap，容易出错。
+    //
+    // QEM（Quadric Edge Collapse）折叠边时用二次误差矩阵评估"引入多少形状误差"，
+    // 优先折叠平面区域、保留边界与尖锐特征 —— 远景是"变简单"而不是"变破"。
+    // 更重要的是 simplify() 返回的索引**引用原顶点**，positions/normals/uvs/
+    // batch_ids 全部不动，pick 属性天然正确（不需要 remap）。
 
-    for i in 0..m.positions.len() {
-        let p = m.positions[i];
-        let key = [
-            (p[0] / cell_size).floor() as i32,
-            (p[1] / cell_size).floor() as i32,
-            (p[2] / cell_size).floor() as i32,
-        ];
-        let new_idx = match map.get(&key) {
-            Some(&v) => v,
-            None => {
-                let v = positions.len() as u32;
-                positions.push(p);
-                normals.push(m.normals[i]);
-                uvs.push(m.uvs[i]);
-                map.insert(key, v);
-                v
-            }
-        };
-        remap.push(new_idx);
+    // 顶点数据字节视图：stride=12（3×f32），position_offset=0
+    let byte_slice: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            m.positions.as_ptr().cast::<u8>(),
+            m.positions.len() * std::mem::size_of::<[f32; 3]>(),
+        )
+    };
+    let adapter = match meshopt::VertexDataAdapter::new(byte_slice, 12, 0) {
+        Ok(a) => a,
+        Err(_) => return m.clone(),
+    };
+
+    // target_count = **目标索引数**（不是三角形数）：按 keep_ratio 折算。
+    // target_error 给一个宽松的相对误差上限（mesh 尺寸的 5%）兜底：
+    // 比例达标但形状误差超限时 meshopt 会停止，避免模型崩坏。
+    let target_count = ((m.indices.len() as f32 * keep_ratio) as usize / 3 * 3).max(12);
+    // 【关键】target_error 必须按层放宽：粗层要减到 2%，形状误差必然很大。
+    //   早先固定 0.05 时，meshopt 还没减到目标数就被误差上限叫停
+    //   （实测比例改到 0.02 后体积仍是 577MB，等于没简化）。
+    //   粗层（比例小）允许大误差，细层（比例大）保持严格。
+    let target_error = (0.05 / keep_ratio).min(1.0);
+    let mut result_error = 0.0f32;
+
+    let mut new_indices = meshopt::simplify::simplify(
+        &m.indices,
+        &adapter,
+        target_count,
+        target_error,
+        // 【关键】Permissive：允许跨属性不连续（UV 接缝/硬边）折叠。
+        //   我们的顶点是 (pos,nrm,uv) 三元组，几乎每个顶点都在缝上——
+        //   默认模式下它们全部不可折叠，实测无论 target_count 给多少都只减 ~50%。
+        //   粗层是远景，缝混合的贴图偏差肉眼不可见，Permissive 是正确取舍。
+        meshopt::simplify::SimplifyOptions::Permissive,
+        Some(&mut result_error),
+    );
+
+    // simplify 失败/退化时退回原 mesh（打日志统计发生率）
+    if new_indices.is_empty() || new_indices.len() >= m.indices.len() {
+        eprintln!(
+            "[lod-skip] {} 索引 {} 未简化 (meshopt 返回 {})",
+            m.name, m.indices.len(), new_indices.len()
+        );
+        return m.clone();
     }
 
-    // 重建索引；三个顶点聚类后重合的三角形是退化三角形，直接丢弃
-    let mut indices: Vec<u32> = Vec::with_capacity(m.indices.len());
-    let mut t = 0;
-    while t + 2 < m.indices.len() {
-        let a = remap[m.indices[t] as usize];
-        let b = remap[m.indices[t + 1] as usize];
-        let c = remap[m.indices[t + 2] as usize];
-        if a != b && b != c && a != c {
-            indices.push(a);
-            indices.push(b);
-            indices.push(c);
-        }
-        t += 3;
-    }
+    // ===== 顶点压实 =====
+    //
+    // simplify 只换索引，被折叠掉的顶点仍留在数组里 → 体积几乎不降（实测
+    // 58 tile 从 192MB 涨到 693MB）。必须压实掉"不再被任何索引引用"的顶点。
+    //
+    // 做法：把 pos/nrm/uv/batch_id 打包成一个 #[repr(C)] 结构体，交给
+    // optimize_vertex_fetch 一起压实 —— 四个数组同步重排，batch_ids 自动正确
+    // （不需要手写 remap，也就不存在 remap 写错导致 pick 属性错位的风险）。
+    let vtxs: Vec<SimplifyVertex> = (0..m.positions.len())
+        .map(|i| SimplifyVertex {
+            pos: m.positions[i],
+            nrm: if i < m.normals.len() { m.normals[i] } else { [0.0, 1.0, 0.0] },
+            uv: if i < m.uvs.len() { m.uvs[i] } else { [0.0, 0.0] },
+            bid: m.batch_ids.get(i).copied().unwrap_or(0),
+        })
+        .collect();
 
-    // batch_ids 按 remap 同步重建（新顶点序 = 聚类代表序）
-    let mut batch_ids: Vec<u32> = vec![0; positions.len()];
-    for (old_i, &new_i) in remap.iter().enumerate() {
-        if let Some(&b) = m.batch_ids.get(old_i) {
-            batch_ids[new_i as usize] = b;
-        }
+    let packed = meshopt::optimize::optimize_vertex_fetch(&mut new_indices, &vtxs);
+
+    let mut positions = Vec::with_capacity(packed.len());
+    let mut normals = Vec::with_capacity(packed.len());
+    let mut uvs = Vec::with_capacity(packed.len());
+    let mut batch_ids = Vec::with_capacity(packed.len());
+    for v in packed {
+        positions.push(v.pos);
+        normals.push(v.nrm);
+        uvs.push(v.uv);
+        batch_ids.push(v.bid);
     }
 
     MeshData {
         positions,
         normals,
         uvs,
-        indices,
+        indices: new_indices,
         name: m.name.clone(),
         texture_uri: m.texture_uri.clone(),
         texture_bytes: m.texture_bytes.clone(),
@@ -202,6 +247,37 @@ pub fn simplify_mesh(m: &MeshData, cell_size: f32) -> MeshData {
         metallic_factor: m.metallic_factor,
         roughness_factor: m.roughness_factor,
     }
+}
+
+/// 简化/压实用的打包顶点：pos + nrm + uv + batchId 一起重排，
+/// 保证几何属性与 pick 属性（batchId）永远对齐。
+#[repr(C)]
+#[derive(Clone, Default)]
+struct SimplifyVertex {
+    pos: [f32; 3],
+    nrm: [f32; 3],
+    uv: [f32; 2],
+    bid: u32,
+}
+
+/// 顶点云的外接球半径（用于把米为单位的误差转成 meshopt 需要的相对误差）
+fn mesh_radius(positions: &[[f32; 3]]) -> f32 {
+    let mut mnx = [f32::INFINITY; 3];
+    let mut mxx = [f32::NEG_INFINITY; 3];
+    for p in positions {
+        for k in 0..3 {
+            if p[k] < mnx[k] {
+                mnx[k] = p[k];
+            }
+            if p[k] > mxx[k] {
+                mxx[k] = p[k];
+            }
+        }
+    }
+    let dx = (mxx[0] - mnx[0]) as f64;
+    let dy = (mxx[1] - mnx[1]) as f64;
+    let dz = (mxx[2] - mnx[2]) as f64;
+    (0.5 * (dx * dx + dy * dy + dz * dz).sqrt()) as f32
 }
 
 /// 把同一 tile 内共享同一贴图（texture_uri 相同）的 mesh 合并成一个大 primitive。

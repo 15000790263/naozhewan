@@ -13,7 +13,7 @@ mod octree;
 mod b3dm;
 
 use octree::{Aabb, OctreeBuilder};
-use b3dm::{build_b3dm, merge_meshes_by_texture, simplify_mesh, MeshData, TileGeometry};
+use b3dm::{build_b3dm, merge_meshes_by_texture, MeshData, TileGeometry};
 
 #[derive(Parser, Debug)]
 #[command(name = "_3dtile", about = "FBX → 3D Tiles 转换工具", version)]
@@ -84,11 +84,13 @@ enum Cmd {
         #[arg(long, default_value_t = 20.0)]
         tile_size_mb: f64,
 
-        /// LOD 层数：0 = 单层（只有最细层，默认）；N = 生成 N+1 层金字塔
+        /// LOD 层数：0 = 单层（无金字塔，不简化）；>=1 = 生成 N+1 层金字塔
+        /// （默认 4，含最细层 + 3 层简化）
         ///
         /// 层级越粗，用顶点聚类简化把顶点按更大网格合并，三角形数大幅下降。
-        /// 远景只加载粗层，实现真正的按距离切换。
-        #[arg(long, default_value_t = 0)]
+        /// 远景只加载粗层，由 Cesium 的 maximumScreenSpaceError 自动切换。
+        /// 想要单层（不简化、不做 LOD）显式传 --lod 0。
+        #[arg(long, default_value_t = 4)]
         lod: u32,
 
         /// 模型定位经度（度）。不传则使用北京天安门默认值。
@@ -982,7 +984,53 @@ fn build_cmd(
         );
     }
 
-    // 4. 对每个节点：提取子树几何 → LOD 简化 → 写 b3dm
+    // 4. 对每个节点：提取子树几何 → 构件级 LOD 过滤 → 写 b3dm
+    //
+    // 构件包围球半径（米）：粗层构件过滤用。逐顶点 g2w 变换取世界 AABB
+    // （ufbx 0.11 Rust 绑定未暴露 bounds，逐顶点一次约 50ms 可接受），半径 = 对角线一半。
+    //
+    // 【key 陷阱】mesh_to_world 的 key = node.mesh 解引用后的 &Mesh 指针。
+    //   scene.meshes.iter() 的 item 是 Ref<Mesh> 包装（临时地址），取它的指针当 key
+    //   会 get 全 None → 半径 map 全空 → 过滤零生效（实测 2217 → 2217）。
+    //   必须用 &scene.meshes[gid] 真引用取指针，key 统一为 gid。
+    let mut mesh_gid_by_ptr: HashMap<usize, usize> = HashMap::new();
+    for gid in 0..scene.meshes.len() {
+        let m: &ufbx::Mesh = &scene.meshes[gid];
+        mesh_gid_by_ptr.insert(m as *const ufbx::Mesh as usize, gid);
+    }
+    let mesh_radius_map: HashMap<usize, f32> = mesh_gid_by_ptr.iter()
+        .filter_map(|(&ptr, &gid)| {
+            let mat = mesh_to_world.get(&ptr)?;
+            let m: &ufbx::Mesh = &scene.meshes[gid];
+            let vp = &m.vertex_position;
+            let mut wmin = [f64::INFINITY; 3];
+            let mut wmax = [f64::NEG_INFINITY; 3];
+            for i in 0..vp.values.len() {
+                let p = unsafe { vp.values.data.add(i).read() };
+                let w = ufbx::transform_position(mat, p);
+                for (k, v) in [w.x, w.y, w.z].iter().enumerate() {
+                    let v = *v as f64 * model_scale;
+                    wmin[k] = wmin[k].min(v);
+                    wmax[k] = wmax[k].max(v);
+                }
+            }
+            if wmin[0].is_infinite() {
+                return None;
+            }
+            let d = [wmax[0] - wmin[0], wmax[1] - wmin[1], wmax[2] - wmin[2]];
+            let r = 0.5 * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            Some((gid, r as f32))
+        })
+        .collect();
+    eprintln!(
+        "[lod] 构件半径统计: {} 个构件，≥25m: {}，≥10m: {}，≥4m: {}，≥1.5m: {}",
+        mesh_radius_map.len(),
+        mesh_radius_map.values().filter(|&&r| r >= 25.0).count(),
+        mesh_radius_map.values().filter(|&&r| r >= 10.0).count(),
+        mesh_radius_map.values().filter(|&&r| r >= 4.0).count(),
+        mesh_radius_map.values().filter(|&&r| r >= 1.5).count(),
+    );
+
     let mut tile_count = 0;
     let mut total_size = 0u64;
     // 节点指针 -> (真实 AABB, 文件名)：用于生成 hierarchical tileset
@@ -991,7 +1039,7 @@ fn build_cmd(
     // tile 序号 i -> b3dm 字节数：单层 tileset 生成 cache-busting 版本参数用
     let mut tile_sizes: HashMap<usize, u64> = HashMap::new();
 
-    for (i, (node, cell)) in specs.iter().enumerate() {
+    for (i, (node, min_radius)) in specs.iter().enumerate() {
         // 该节点子树的全部 mesh（中间节点要收后代，才能生成覆盖整块的粗模型）
         let mut mesh_ids: Vec<usize> = Vec::new();
         if node.is_leaf() {
@@ -1001,6 +1049,32 @@ fn build_cmd(
         }
         mesh_ids.sort_unstable();
         mesh_ids.dedup();
+
+        // ===== 构件级 LOD 过滤（对齐 ion 行为）=====
+        //
+        // 粗层只保留"大构件"（包围球半径 ≥ 阈值），小构件（管道/阀门/小罐）
+        // 整体消失；放大进入更细层后小构件逐层回来。构件是原样几何（零简化），
+        // 所以远景永远不会出现"地面被咬掉一块"的破碎观感。
+        if *min_radius > 0.0 {
+            let before = mesh_ids.len();
+            mesh_ids.retain(|&gid| mesh_radius_map.get(&gid).copied().unwrap_or(f32::INFINITY) >= *min_radius);
+            // 兜底：整片区域全是小构件时保留最大的一个，避免该区域远景完全空白
+            if mesh_ids.is_empty() {
+                let mut ids = Vec::new();
+                if node.is_leaf() { ids.extend_from_slice(&node.mesh_ids); } else { node.collect_subtree_mesh_ids(&mut ids); }
+                if let Some(biggest) = ids.iter().copied().max_by(|a, b| {
+                    let ra = mesh_radius_map.get(a).copied().unwrap_or(0.0);
+                    let rb = mesh_radius_map.get(b).copied().unwrap_or(0.0);
+                    ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+                }) {
+                    mesh_ids.push(biggest);
+                }
+            }
+            eprintln!(
+                "[lod] tile#{} min_r={:.1}m: 构件 {} → {}",
+                i, min_radius, before, mesh_ids.len()
+            );
+        }
 
         // 按 per-face material 拆分：每个 sub-mesh 用自己真正的 baseColor 贴图
         let mut meshes = Vec::new();
@@ -1014,11 +1088,6 @@ fn build_cmd(
                 flip_winding: linear_determinant(mat) < 0.0,
             });
             meshes.extend(extract_mesh_parts(m, input_dir, xform.as_ref(), metallic, roughness, mesh_id));
-        }
-
-        // LOD 简化（cell == 0 表示最细层，不动）
-        if *cell > 0.0 {
-            meshes = meshes.iter().map(|m| simplify_mesh(m, *cell)).collect();
         }
 
         // ===== pick 属性（Batch Table + _BATCHID）=====
@@ -1089,12 +1158,12 @@ fn build_cmd(
 
         if tile_count <= 8 || tile_count % 20 == 0 {
             eprintln!(
-                "[build]  [{}] depth={} mesh={} 三角形={} cell={:.2} b3dm={:.2} KB ge={:.3}",
+                "[build]  [{}] depth={} mesh={} 三角形={} min_r={:.1} b3dm={:.2} KB ge={:.3}",
                 i,
                 node.depth,
                 geometry.meshes.len(),
                 geometry.total_triangles(),
-                cell,
+                min_radius,
                 b3dm_bytes.len() as f64 / 1024.0,
                 ge,
             );
@@ -1350,15 +1419,23 @@ fn write_scenetree(
 
 /// LOD 层号 → 顶点聚类网格边长（米）
 ///
-/// 层号 0 = 最细（八叉树叶节点，不简化）；数字越大层越粗。
-/// 每粗一级网格放大约 4 倍，三角形数通常降到上一级的 1/3 ~ 1/5。
-fn lod_cell_size(lod_layer: u32) -> f32 {
+/// 层号 h = 节点到子树最深叶节点的高度（h=0 最细层）。
+///
+/// 返回值 = **构件保留的最小包围球半径（米）**——构件级过滤，不做几何简化。
+///
+/// 【为什么改成构件过滤而不是几何简化】
+///   用户对比 Cesium ion 版的预期行为：远景时**小构件（管道/阀门/小罐）整体消失**，
+///   大结构（地面/建筑/大罐）完整保留；放大后小构件逐层回来。
+///   之前用 QEM 把整 tile 几何揉在一起简化，大地面也被折出洞（用户："像狗咬了一块"）。
+///   构件过滤后粗层 content = 大构件的**原样几何**（零简化）——地面永远完整，
+///   小构件按尺寸阈值逐层出现/消失，与 ion 观感一致，且省掉 QEM 计算时间。
+fn lod_min_radius(lod_layer: u32) -> f32 {
     match lod_layer {
-        0 => 0.0,   // 最细层：不简化，保留全部几何细节
-        1 => 0.35,
-        2 => 1.5,
-        3 => 6.0,
-        _ => 24.0,
+        0 => 0.0,   // 最细层：不过滤，全部构件
+        1 => 1.5,
+        2 => 4.0,
+        3 => 10.0,
+        _ => 25.0,
     }
 }
 
@@ -1399,12 +1476,12 @@ fn collect_lod_nodes<'a>(
     // 八叉树会提前停止细分，depth=3 就可能已经是叶节点。若按 max_depth 硬算，
     // 这些浅层叶节点会被当成粗层用 cell=0.35 简化，最精细的一层几何精度直接
     // 被砍掉（实测最细层只剩 84 万三角形，而全精度应有 253 万）。
-    // 叶节点高度 h=0 -> cell=0，即不简化。
+    // 叶节点高度 h=0 -> min_radius=0，即不过滤（全构件）。
     let deepest = subtree_leaf_depth(node);
     let h = deepest.saturating_sub(node.depth);
     let _ = max_depth;
-    let cell = lod_cell_size(h.min(lod_levels));
-    out.push((node, cell));
+    let min_radius = lod_min_radius(h.min(lod_levels));
+    out.push((node, min_radius));
     for c in &node.children {
         collect_lod_nodes(c, max_depth, lod_levels, out);
     }
@@ -1590,10 +1667,15 @@ fn linear_determinant(m: &ufbx::Matrix) -> f64 {
 /// 总 GPU 占用 ~120MB 远低于 Cesium 内部 cache 上限，拖动可 0 重 fetch。
 /// 视觉损失：油库远景几乎看不出，近景屋顶纹理用 mipmap 链补足。
 fn process_texture(bytes: &[u8]) -> Option<(Vec<u8>, String, bool)> {
+    process_texture_sized(bytes, 256)
+}
+
+/// 带目标边长参数的贴图压缩：解码 → 超过 max_edge 降采样 → 按是否真有 alpha 编码 PNG/JPEG(q80)。
+fn process_texture_sized(bytes: &[u8], max_edge: u32) -> Option<(Vec<u8>, String, bool)> {
     let img = image::load_from_memory(bytes).ok()?;
     let (w, h) = (img.width(), img.height());
-    let img = if w.max(h) > 256 {
-        let s = 256.0_f32 / w.max(h) as f32;
+    let img = if w.max(h) > max_edge {
+        let s = max_edge as f32 / w.max(h) as f32;
         let nw = ((w as f32 * s).round() as u32).max(1);
         let nh = ((h as f32 * s).round() as u32).max(1);
         img.resize(nw, nh, image::imageops::FilterType::Triangle)
@@ -1629,6 +1711,14 @@ fn process_texture(bytes: &[u8]) -> Option<(Vec<u8>, String, bool)> {
 /// 同一贴图可能被上百个 mesh 引用，压缩结果全局缓存，避免重复解码/缩放。
 fn texture_cache() -> &'static std::sync::Mutex<HashMap<String, std::sync::Arc<(Vec<u8>, String, bool)>>> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::sync::Arc<(Vec<u8>, String, bool)>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// LOD 粗层贴图缓存：key = (uri, 目标边长)。粗层 34 个 tile 大量共享同一批贴图，
+/// 不缓存的话同一张贴图会被重复解码/缩放几十次。
+fn lod_texture_cache() -> &'static std::sync::Mutex<HashMap<(String, u32), std::sync::Arc<(Vec<u8>, String, bool)>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, u32), std::sync::Arc<(Vec<u8>, String, bool)>>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }

@@ -25,6 +25,10 @@ serde_json = "1"
 # 贴图压缩：降采样 + JPEG 重编码（显存/加载速度的关键，实测 286MB→~20MB）
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
+# 网格简化（LOD）：官方 meshoptimizer 的 Rust wrapper，C 源码由 cargo 自动编译（同 ufbx，无需 vcpkg）
+# 用 QEM 保形简化替代顶点分桶——分桶会把地面"狗咬"式削掉，QEM 保边界/保尖锐特征
+meshopt = "0.6"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
